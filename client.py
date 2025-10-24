@@ -1,19 +1,24 @@
 import tkinter as tk
-from tkinter import messagebox
-import socket
-import json
-import threading
+from tkinter import messagebox, scrolledtext, simpledialog
 from getmac import get_mac_address
+import socket
+import threading
+import json
+import time
+import sys
 
 # --- Constants ---
-# !! Change this to the server's IP address !!
-SERVER_HOST = '10.83.175.161' 
+SERVER_HOST = '10.83.175.161'  # Change to server's IP if not running locally
 SERVER_PORT = 12345
+
 
 class ChatClient:
     def __init__(self, root):
         self.root = root
-        self.root.withdraw()  # Hide the main root window initially
+        self.root.title("Video Chat")
+        self.root.geometry("300x150") # Initial size, will be resized
+        self.root.withdraw()  # Hide main window initially
+
         self.username = None
         self.socket = None
         self.login_window = None # Will hold login window
@@ -21,69 +26,74 @@ class ChatClient:
         self.is_remembered = False # Flag to track if user is in server's list
         self.exit_prompt_window = None # Will hold the exit prompt
         
+        # --- Chat Data ---
+        self.chat_history = []
+        self.chat_display = None
+        self.chat_entry = None
+        self.listen_thread = None
+
         # Get MAC address
         self.mac_address = get_mac_address()
         if not self.mac_address:
-            messagebox.showerror("Network Error", "Could not get MAC address. Exiting.")
+            messagebox.showerror("Fatal Error", "Could not determine MAC address. Exiting.")
             self.root.destroy()
             return
-            
-        # self.show_login_window() # We no longer show this first
-        self.start_auto_login()
-
-    def show_connecting_window(self):
-        """Shows a simple 'Connecting...' popup."""
-        self.connecting_window = tk.Toplevel(self.root)
-        self.connecting_window.title("Connecting")
-        self.connecting_window.geometry("250x100")
-        self.connecting_window.resizable(False, False)
         
-        # Center the window
-        self.connecting_window.update_idletasks()
-        x = self.root.winfo_screenwidth() // 2 - 125
-        y = self.root.winfo_screenheight() // 2 - 50
-        self.connecting_window.geometry(f"+{x}+{y}")
-        
-        tk.Label(self.connecting_window, text="Connecting to server...", pady=20).pack()
-        
-        # Handle user closing this window
-        self.connecting_window.protocol("WM_DELETE_WINDOW", self.on_login_close)
-
-    def start_auto_login(self):
-        """Shows 'Connecting...' and starts the auto-login thread."""
+        # Start the connection process
         self.show_connecting_window()
         threading.Thread(target=self.try_auto_login, daemon=True).start()
 
+    def show_connecting_window(self):
+        """Shows a small 'Connecting...' popup."""
+        self.connecting_window = tk.Toplevel(self.root)
+        self.connecting_window.title("Connecting")
+        self.connecting_window.geometry("250x80")
+        
+        # Center the prompt
+        self.connecting_window.update_idletasks()
+        x = self.root.winfo_screenwidth() // 2 - 125
+        y = self.root.winfo_screenheight() // 2 - 40
+        self.connecting_window.geometry(f"+{x}+{y}")
+
+        self.connecting_window.resizable(False, False)
+        self.connecting_window.grab_set()
+        
+        tk.Label(self.connecting_window, text="Attempting to connect...", pady=10).pack(pady=10)
+        
+        self.connecting_window.protocol("WM_DELETE_WINDOW", self.root.destroy) # Close all if this is closed
+
     def try_auto_login(self):
-        """Tries to log in using just the MAC address."""
+        """Attempts to log in automatically using just the MAC address."""
         try:
+            # 1. Create a new socket for this attempt
             temp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             temp_socket.connect((SERVER_HOST, SERVER_PORT))
 
-            # 1. Send initial auto-login handshake
+            # 2. Send AUTO_LOGIN handshake
             handshake_data = {
                 "mac": self.mac_address,
                 "type": "AUTO_LOGIN"
             }
             temp_socket.sendall(json.dumps(handshake_data).encode('utf-8'))
 
-            # 2. Wait for server response
-            response_raw = temp_socket.recv(1024).decode('utf-8')
+            # 3. Wait for server's response
+            response_raw = temp_socket.recv(4096).decode('utf-8')
             if not response_raw:
-                raise ConnectionError("Server closed connection.")
+                raise ConnectionError("Server closed connection unexpectedly.")
             
             response_data = json.loads(response_raw)
 
-            # 3. Process response
+            # 4. Process response
             if response_data.get("status") == "OK":
                 # Auto-login successful!
                 self.username = response_data.get("username")
                 self.is_remembered = response_data.get("remembered", True)
+                self.chat_history = response_data.get("chat_history", []) # Get history
                 self.socket = temp_socket # Keep this socket
                 self.root.after(0, self.show_main_window)
             
             elif response_data.get("status") == "REQUIRE_USERNAME":
-                # Server doesn't know us, need to show login window
+                # Server doesn't know this MAC, need manual login
                 self.root.after(0, self.show_login_window)
                 temp_socket.close() # Close this connection, manual login will make a new one
 
@@ -96,102 +106,86 @@ class ChatClient:
                 raise ConnectionError(f"Received invalid response: {response_data.get('status')}")
 
         except Exception as e:
-            # Any error in auto-login, we fall back to manual login
-            self.root.after(0, self.show_login_window)
-            if 'temp_socket' in locals():
-                temp_socket.close()
-        finally:
-            # Hide the 'Connecting...' window
+            print(f"Auto-login failed: {e}")
+            self.root.after(0, lambda: messagebox.showerror("Connection Failed", f"Could not connect to server: {e}\n\nIs the server running?"))
+            # If auto-login fails, maybe fall back to manual login?
+            # For now, just show manual login if server is reachable
+            if "REQUIRE_USERNAME" not in str(e):
+                self.root.after(0, self.root.destroy) # Exit if connection failed
             if self.connecting_window:
                 self.root.after(0, self.connecting_window.destroy)
 
     def show_login_window(self):
-        """Creates the initial login pop-up window."""
-        # Ensure 'Connecting' window is gone if it's still somehow open
+        """Shows the manual login window."""
+        # Close connecting window if it's open
         if self.connecting_window:
             try:
                 self.connecting_window.destroy()
             except tk.TclError:
-                pass # Window might already be destroyed
+                pass
             self.connecting_window = None
-            
-        if self.login_window and self.login_window.winfo_exists(): # Already open?
-            self.login_window.lift()
-            return 
-            
+
         self.login_window = tk.Toplevel(self.root)
         self.login_window.title("Login")
-        self.login_window.geometry("300x150")
-        self.login_window.resizable(False, False)
         
-        # Center the login window
+        # Center the prompt
         self.login_window.update_idletasks()
         x = self.root.winfo_screenwidth() // 2 - 150
-        y = self.root.winfo_screenheight() // 2 - 75
-        self.login_window.geometry(f"+{x}+{y}")
+        y = self.root.winfo_screenheight() // 2 - 100
+        self.login_window.geometry(f"300x200+{x}+{y}")
+        self.login_window.resizable(False, False)
         
-        main_frame = tk.Frame(self.login_window, padx=10, pady=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        tk.Label(self.login_window, text=f"Welcome! Please choose a username.", pady=5).pack(pady=(10,5))
         
-        tk.Label(main_frame, text="Enter Username:").pack(pady=5)
+        tk.Label(self.login_window, text="Username:").pack()
+        username_entry = tk.Entry(self.login_window, width=30)
+        username_entry.pack(pady=5, padx=20)
         
-        self.username_entry = tk.Entry(main_frame, width=30)
-        self.username_entry.pack(pady=5, padx=10)
+        remember_var = tk.BooleanVar()
+        remember_check = tk.Checkbutton(self.login_window, text="Remember me", variable=remember_var)
+        remember_check.pack(pady=5)
         
-        self.remember_me_var = tk.BooleanVar()
-        self.remember_me_check = tk.Checkbutton(main_frame, text="Remember me", variable=self.remember_me_var)
-        self.remember_me_check.pack(pady=5)
-        
-        self.connect_button = tk.Button(main_frame, text="Connect", command=self.attempt_manual_login)
+        self.connect_button = tk.Button(self.login_window, text="Connect", 
+                                        command=lambda: self.try_manual_login(username_entry.get(), remember_var.get()))
         self.connect_button.pack(pady=10)
         
-        self.login_window.protocol("WM_DELETE_WINDOW", self.on_login_close)
+        self.login_window.protocol("WM_DELETE_WINDOW", self.root.destroy) # Close all if this is closed
+        self.login_window.grab_set()
 
-    def on_login_close(self):
-        """Handle closing the login window."""
-        self.root.destroy() # Close the entire application
-
-    def attempt_manual_login(self):
-        """Called when the 'Connect' button is pressed."""
-        username = self.username_entry.get().strip()
-        if not username:
-            messagebox.showwarning("Input Error", "Username cannot be empty.", parent=self.login_window)
+    def try_manual_login(self, requested_username, remember_me):
+        """Attempts to log in manually with a chosen username."""
+        if not requested_username.strip():
+            messagebox.showerror("Invalid Input", "Username cannot be empty.", parent=self.login_window)
             return
             
-        remember = self.remember_me_var.get()
-        
-        # Disable button to prevent multiple clicks
         self.connect_button.config(text="Connecting...", state="disabled")
-
-        # Start connection attempt in a new thread to not freeze the login GUI
-        threading.Thread(target=self.try_manual_login, args=(username, remember), daemon=True).start()
-
-    def try_manual_login(self, username, remember):
-        """Handles the socket connection and handshake for manual login."""
+        
         try:
+            # 1. Create a new socket for this attempt
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.connect((SERVER_HOST, SERVER_PORT))
 
-            # 1. Send manual login handshake data
+            # 2. Send MANUAL_LOGIN handshake
             handshake_data = {
                 "mac": self.mac_address,
                 "type": "MANUAL_LOGIN",
-                "requested_username": username,
-                "remember_me": remember
+                "requested_username": requested_username,
+                "remember_me": remember_me
             }
             self.socket.sendall(json.dumps(handshake_data).encode('utf-8'))
 
-            # 2. Wait for server response
-            response_raw = self.socket.recv(1024).decode('utf-8')
+            # 3. Wait for server's response
+            response_raw = self.socket.recv(4096).decode('utf-8')
             if not response_raw:
                 raise ConnectionError("Server closed connection unexpectedly.")
             
             response_data = json.loads(response_raw)
-
-            # 3. Process response
+            
+            # 4. Process response
             if response_data.get("status") == "OK":
                 self.username = response_data.get("username")
                 self.is_remembered = response_data.get("remembered", False)
+                self.chat_history = response_data.get("chat_history", []) # Get history
                 # Schedule GUI update on the main thread
                 # We need to destroy the login window and show the main one
                 self.root.after(0, self.login_window.destroy)
@@ -200,7 +194,6 @@ class ChatClient:
             
             elif response_data.get("status") == "ALREADY_CONNECTED":
                 # Server says we're already logged in. Show the special error.
-                # We need to destroy the login window and show the error instead.
                 self.root.after(0, self.login_window.destroy)
                 self.login_window = None
                 self.root.after(0, self.show_already_connected_error)
@@ -210,37 +203,27 @@ class ChatClient:
 
             elif response_data.get("status") == "USERNAME_TAKEN":
                 messagebox.showerror("Login Failed", 
-                                     f"The username '{username}' is already taken. Please try another.",
+                                     f"The username '{requested_username}' is already taken. Please choose another.", 
                                      parent=self.login_window)
-                # Re-enable button
+                # Re-enable button and close socket
                 self.root.after(0, lambda: self.connect_button.config(text="Connect", state="normal"))
                 self.socket.close()
                 self.socket = None # Clear the socket
-
+            
             else:
-                raise ConnectionError(f"Received invalid response from server: {response_data.get('status')}")
+                raise ConnectionError(f"Received invalid response: {response_data.get('status')}")
 
-        except ConnectionRefusedError:
-            messagebox.showerror("Connection Failed", 
-                                 "Could not connect to the server. Is it running?",
-                                 parent=self.login_window)
-            self.root.after(0, lambda: self.connect_button.config(text="Connect", state="normal"))
         except Exception as e:
-            messagebox.showerror("Error", f"An error occurred: {e}", parent=self.login_window)
+            print(f"Manual login failed: {e}")
+            messagebox.showerror("Connection Failed", f"Could not connect to server: {e}", parent=self.login_window)
             self.root.after(0, lambda: self.connect_button.config(text="Connect", state="normal"))
             if self.socket:
                 self.socket.close()
-                self.socket = None # Clear the socket
+                self.socket = None
 
     def show_main_window(self):
-        """Destroys the login window and shows the main application window."""
-        # Ensure login/connecting windows are gone
-        if self.login_window:
-            try:
-                self.login_window.destroy()
-            except tk.TclError:
-                pass
-            self.login_window = None
+        """Shows the main application window (video + chat)."""
+        # Close connecting window if it's open
         if self.connecting_window:
             try:
                 self.connecting_window.destroy()
@@ -251,6 +234,7 @@ class ChatClient:
         self.root.deiconify() # Un-hide the main window
         self.root.title(f"Video Chat - {self.username} (MAC: {self.mac_address})")
         self.root.geometry("800x600")
+        self.root.minsize(500, 400) # Set a minimum size
 
         # --- Top bar for controls ---
         top_frame = tk.Frame(self.root, bg="#f0f0f0")
@@ -260,36 +244,144 @@ class ChatClient:
         
         exit_button = tk.Button(top_frame, text="Exit", bg="#e63946", fg="white", font=("Arial", 10, "bold"), command=self.handle_exit_click, borderwidth=0, padx=10, pady=2)
         exit_button.pack(side=tk.RIGHT, padx=10, pady=5)
-
-        # --- Main content area ---
-        main_content_frame = tk.Frame(self.root)
-        main_content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
         
-        tk.Label(main_content_frame, 
-                 text="Connection established.\nVideo streaming will be implemented here.",
-                 font=("Arial", 12)).pack(pady=40)
+        # --- Main content area (PanedWindow) ---
+        main_pane = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, sashrelief=tk.RAISED, sashwidth=4, bg="#f0f0f0")
+        main_pane.pack(fill=tk.BOTH, expand=True)
 
-        # Start a thread to listen for server messages (e.g., video data)
-        # self.listen_thread = threading.Thread(target=self.listen_for_data, daemon=True)
-        # self.listen_thread.start()
+        # --- Left Pane (for video) ---
+        video_frame = tk.Frame(main_pane, bg="#333333")
+        tk.Label(video_frame, 
+                 text="Video feeds will go here",
+                 font=("Arial", 12), bg="#333333", fg="white").pack(expand=True)
+        main_pane.add(video_frame, width=550) # Give it a default width
+
+        # --- Right Pane (for chat) ---
+        chat_frame = tk.Frame(main_pane, bg="white")
         
-        self.root.protocol("WM_DELETE_WINDOW", self.handle_exit_click) # Changed from on_main_close
+        # Chat display
+        chat_display_frame = tk.Frame(chat_frame, bg="white")
+        chat_display_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=(5,0))
+        
+        chat_scrollbar = tk.Scrollbar(chat_display_frame)
+        chat_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.chat_display = tk.Text(chat_display_frame, 
+                                    state='disabled', 
+                                    wrap=tk.WORD, 
+                                    font=("Arial", 9),
+                                    yscrollcommand=chat_scrollbar.set,
+                                    borderwidth=0,
+                                    highlightthickness=0,
+                                    padx=5, pady=5)
+        self.chat_display.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        chat_scrollbar.config(command=self.chat_display.yview)
+
+        # Configure tags for chat formatting
+        self.chat_display.tag_config("username", font=("Arial", 9, "bold"))
+        self.chat_display.tag_config("message", font=("Arial", 9))
+        self.chat_display.tag_config("system", font=("Arial", 9, "italic"), foreground="#555555")
+
+        # Chat input
+        chat_input_frame = tk.Frame(chat_frame, bg="white")
+        chat_input_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.chat_entry = tk.Entry(chat_input_frame, font=("Arial", 10), borderwidth=1, relief="solid")
+        self.chat_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+        
+        send_button = tk.Button(chat_input_frame, text="Send", command=self.send_chat_message, borderwidth=1, relief="raised", padx=5)
+        send_button.pack(side=tk.RIGHT, padx=(5,0))
+        
+        # Bind <Return> key to send message
+        self.chat_entry.bind("<Return>", lambda event: self.send_chat_message())
+
+        main_pane.add(chat_frame, width=250) # Give chat a default width
+
+        # --- Populate chat history ---
+        for username, message in self.chat_history:
+            self.append_chat_message(username, message)
+        self.append_chat_message("System", "You have joined the chat.", system=True)
+        
+        # Start listening for new messages
+        self.listen_thread = threading.Thread(target=self.listen_for_data, daemon=True)
+        self.listen_thread.start()
+        
+        self.root.protocol("WM_DELETE_WINDOW", self.handle_exit_click)
+
+    def append_chat_message(self, username, message, system=False):
+        """Thread-safe way to add a message to the chat display."""
+        try:
+            if not self.chat_display:
+                return # Window closed
+
+            self.chat_display.config(state='normal')
+            
+            if system:
+                self.chat_display.insert(tk.END, f"{message}\n", "system")
+            else:
+                self.chat_display.insert(tk.END, f"{username}: ", "username")
+                self.chat_display.insert(tk.END, f"{message}\n", "message")
+            
+            self.chat_display.config(state='disabled')
+            self.chat_display.see(tk.END)
+        except tk.TclError:
+            # This can happen if the window is destroyed
+            pass
+    
+    def send_chat_message(self):
+        """Sends a chat message to the server."""
+        message = self.chat_entry.get().strip()
+        if message and self.socket:
+            try:
+                message_json = {"type": "CHAT_MESSAGE", "payload": message}
+                self.socket.sendall(json.dumps(message_json).encode('utf-8'))
+                self.chat_entry.delete(0, tk.END)
+            except Exception as e:
+                self.append_chat_message("System", f"Error sending message: {e}", system=True)
 
     def listen_for_data(self):
-        """(Future use) Listens for incoming data from the server."""
-        while True:
+        """Listens for data (chat, video commands) from the server in a thread."""
+        while self.socket:
             try:
-                data = self.socket.recv(4096) # Buffer size will need to be much larger for video
+                data = self.socket.recv(1024)
                 if not data:
+                    # Server closed connection
                     break
-                # Process video/audio data here
-            except Exception:
-                break # Socket closed
+                
+                # We assume control messages are JSON.
+                # Video data will be raw and fail the JSON load.
+                try:
+                    message = json.loads(data.decode('utf-8'))
+                    msg_type = message.get("type")
+                    
+                    if msg_type == "NEW_CHAT":
+                        username = message.get("username", "Server")
+                        payload = message.get("payload", "")
+                        # Schedule GUI update on main thread
+                        self.root.after(0, self.append_chat_message, username, payload)
+                    
+                    # ... other control message types (like "USER_JOINED", "USER_LEFT") could go here ...
+                
+                except json.JSONDecodeError:
+                    # Not a JSON message, probably video data.
+                    # We'll ignore it for now.
+                    pass
+                
+            except (ConnectionResetError, ConnectionAbortedError):
+                break
+            except Exception as e:
+                print(f"Error in listen thread: {e}")
+                break
         
-        if self.socket:
-            self.socket.close()
-        messagebox.showinfo("Disconnected", "You have been disconnected from the server.")
-        self.root.destroy()
+        # If loop breaks, connection is lost
+        if self.root.winfo_exists():
+            self.root.after(0, self.append_chat_message, "System", "Disconnected from server.", system=True)
+            # Maybe show a reconnect button or just disable chat
+            if self.chat_entry:
+                try:
+                    self.chat_entry.config(state='disabled')
+                except tk.TclError:
+                    pass # Window already closed
 
     def handle_exit_click(self):
         """Called by the Exit button or window 'X'."""
@@ -318,7 +410,7 @@ class ChatClient:
         self.exit_prompt_window.grab_set() # Modal behavior
         self.exit_prompt_window.transient(self.root)
 
-        tk.Label(self.exit_prompt_window, text="You are a remembered user. How do you want to exit?", pady=10).pack()
+        tk.Label(self.exit_prompt_window, text="You are a remembered user. How do you want to exit?", pady=10, wraplength=330).pack()
         
         button_frame = tk.Frame(self.exit_prompt_window)
         button_frame.pack(pady=10)
@@ -342,10 +434,17 @@ class ChatClient:
  
     def on_main_close(self):
         """Handles closing the main application window."""
-        if self.socket:
-            self.socket.close()
+        temp_socket = self.socket
+        self.socket = None # This will stop the listen_thread
+        
+        if temp_socket:
+            try:
+                temp_socket.close()
+            except Exception as e:
+                print(f"Error closing socket: {e}")
+        
         self.root.destroy()
-
+    
     def show_already_connected_error(self):
         """Shows a final error window when a connection already exists."""
         # 1. Destroy any lingering login/connecting windows
@@ -387,9 +486,10 @@ class ChatClient:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = ChatClient(root)
-    root.mainloop()
-
-
+    try:
+        root = tk.Tk()
+        app = ChatClient(root)
+        root.mainloop()
+    except KeyboardInterrupt:
+        sys.exit(0)
 

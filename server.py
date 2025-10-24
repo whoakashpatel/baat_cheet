@@ -11,6 +11,7 @@ import time
 HOST = '10.83.175.161'  # Listen on all available interfaces
 PORT = 12345
 USER_DATA_FILE = 'remembered_users.json'
+MAX_HISTORY = 100 # Max chat messages to store
 
 
 class ChatServer:
@@ -26,6 +27,10 @@ class ChatServer:
         # {conn: (username, mac)}
         self.active_connections = {}
         self.active_conn_lock = threading.Lock()
+
+        # --- Chat History ---
+        self.chat_history = [] # List of (username, message) tuples
+        self.chat_lock = threading.Lock()
 
         # --- GUI ---
         self.setup_gui()
@@ -265,6 +270,12 @@ class ChatServer:
                 "username": username_to_use,
                 "remembered": remembered_status # Add this flag
             }
+            
+            # Add chat history to the response if login was OK
+            if response_status == "OK":
+                with self.chat_lock:
+                    response_data["chat_history"] = self.chat_history
+            
             conn.sendall(json.dumps(response_data).encode('utf-8'))
 
             # 4. If successful, add to active list and proceed
@@ -274,6 +285,14 @@ class ChatServer:
                 
                 self.update_active_user_list()
                 self.log_message(f"User '{username_to_use}' successfully connected.")
+                
+                # Broadcast join message
+                join_msg = {
+                    "type": "NEW_CHAT",
+                    "username": "System",
+                    "payload": f"'{username_to_use}' has joined the chat."
+                }
+                self.broadcast(json.dumps(join_msg))
 
                 # --- This is where the video/audio streaming loop will go ---
                 # For now, just keep the connection alive until they disconnect
@@ -286,13 +305,35 @@ class ChatServer:
                             # Client disconnected gracefully
                             break
                         
-                        # Check for FORGET_ME message
+                        # Check for JSON control messages
                         try:
                             message = json.loads(data.decode('utf-8'))
-                            if message.get("type") == "FORGET_ME":
+                            msg_type = message.get("type")
+
+                            if msg_type == "FORGET_ME":
                                 self.log_message(f"Received FORGET_ME request from '{username_to_use}'.")
                                 self.forget_user(client_mac)
-                                # Client will close connection, so we just wait for the disconnect
+                            
+                            elif msg_type == "CHAT_MESSAGE":
+                                payload = message.get("payload")
+                                if payload:
+                                    self.log_message(f"Chat from '{username_to_use}': {payload}")
+                                    
+                                    # Add to history (with lock)
+                                    with self.chat_lock:
+                                        self.chat_history.append((username_to_use, payload))
+                                        # Trim history if it's too long
+                                        if len(self.chat_history) > MAX_HISTORY:
+                                            self.chat_history = self.chat_history[-MAX_HISTORY:]
+                                    
+                                    # Broadcast to all clients
+                                    broadcast_msg = {
+                                        "type": "NEW_CHAT",
+                                        "username": username_to_use,
+                                        "payload": payload
+                                    }
+                                    self.broadcast(json.dumps(broadcast_msg))
+
                         except json.JSONDecodeError:
                             # This is expected when video data starts flowing
                             # For now, we'll just ignore non-JSON data
@@ -302,6 +343,13 @@ class ChatServer:
                     pass # Client disconnected abruptly
                 finally:
                     self.log_message(f"User '{username_to_use}' disconnected.")
+                    # Broadcast leave message
+                    leave_msg = {
+                        "type": "NEW_CHAT",
+                        "username": "System",
+                        "payload": f"'{username_to_use}' has left the chat."
+                    }
+                    self.broadcast(json.dumps(leave_msg))
             
         except json.JSONDecodeError:
             self.log_message(f"Invalid JSON from {addr[0]}. Dropping.")
@@ -317,6 +365,20 @@ class ChatServer:
         
         self.update_active_user_list()
         conn.close()
+
+    def broadcast(self, message_json_string):
+        """Broadcasts a JSON string message to all active clients."""
+        with self.active_conn_lock:
+            # Create a list of connections to iterate over
+            # This avoids holding the lock while sending, which can be slow
+            all_conns = list(self.active_connections.keys())
+        
+        for conn in all_conns:
+            try:
+                conn.sendall(message_json_string.encode('utf-8'))
+            except (OSError, ConnectionResetError, BrokenPipeError) as e:
+                # Client might have disconnected, server will clean it up on recv() fail
+                self.log_message(f"Error broadcasting to a client: {e}. (Will be cleaned up shortly)")
 
     def forget_user(self, mac_to_forget):
         """Finds a user by MAC and removes them from the remembered list."""
