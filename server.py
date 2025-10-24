@@ -218,6 +218,15 @@ class ChatServer:
                 req_username = client_data['requested_username']
                 remember_me = client_data['remember_me']
                 
+                # --- NEW DUPLICATE USERNAME CHECK (Checks active AND remembered) ---
+                username_is_active = False
+                with self.active_conn_lock:
+                    for (username, mac) in self.active_connections.values():
+                        if username == req_username:
+                            username_is_active = True
+                            break
+                # --- END NEW DUPLICATE USERNAME CHECK ---
+                
                 if found_user_for_mac and found_user_for_mac == req_username:
                     # This happens if user exists, but somehow got to manual login.
                     # This is fine, just log them in.
@@ -225,10 +234,13 @@ class ChatServer:
                     response_status = "OK"
                     self.log_message(f"Manual login for recognized user '{username_to_use}'.")
                 
-                elif req_username in self.remembered_users: # Safe to read, as it's static unless a write lock is held
-                    # Username is taken (by a *different* MAC)
+                elif (req_username in self.remembered_users) or username_is_active: # <-- MODIFIED THIS LINE
+                    # Username is taken (by a *different* MAC) either in remembered list or active list
                     response_status = "USERNAME_TAKEN"
-                    self.log_message(f"Refused: MAC {client_mac} requested username '{req_username}', which is taken.")
+                    if username_is_active:
+                         self.log_message(f"Refused: MAC {client_mac} requested username '{req_username}', which is *currently active*.")
+                    else:
+                        self.log_message(f"Refused: MAC {client_mac} requested username '{req_username}', which is *remembered*.")
                 
                 else:
                     # New user, or existing user with a new username (not allowed by current logic, but OK)
